@@ -1,0 +1,408 @@
+//MAIN
+var $montecarlo = (function () {
+
+    return new function () {
+
+        var _mc = this;
+        var _ready = false;
+
+        dll.namespace('mcbase')
+
+            .load('threading', '/content/solution/eqd/threading/js/threading.js')
+                        
+            .extend(_mc) //vs .build()
+
+            .yield(function (mcbase) {
+
+                dll.namespace('montecarlo')
+
+                    .extend(mcbase)
+                                        
+                    .load('loadPortfolioTask', '/content/solution/eqd/montecarlo/js/tasks/loadportfolio.js')
+                    .load('loadPricesTask', '/content/solution/eqd/montecarlo/js/tasks/loadprices.js')
+                    .load('createMatrixTask', '/content/solution/eqd/montecarlo/js/tasks/creatematrix.js')
+                    .load('calculateCorrelationsTask', '/content/solution/eqd/montecarlo/js/tasks/calculatecorrelations.js')
+                                    
+                    .yield(function (montecarlo) {
+
+                        if (_ready) return;
+                        _ready = true;
+                        _readycallbacks.forEach(function (cb) { cb(); });
+
+                    });
+                
+            });
+
+        var _readycallbacks = [];
+        _mc.ready = function (cb) {
+            if (!_ready) { _readycallbacks.push(cb); return; }
+            cb();
+        };
+        
+        _mc.Simulation = function () {
+            return new function () {
+                    
+                var _sim = this;
+
+                var _numpos = 1;
+                var _pricedays = 365 * 5;
+
+                var _verbose = false;
+                var _threads = 1;
+
+                _sim.threads = function (n) {
+                    _threads = n;
+                    return _sim;
+                };
+
+                _sim.verbose = function (trueFalse) {
+                    _verbose = trueFalse === undefined ? true : trueFalse;
+                    return _sim;
+                };
+
+                /*
+                    Sets number of positions to run simulation for
+                */
+                _sim.positions = function (positions) {
+                    _numpos = positions;
+                    return _sim;
+                };
+
+                /*
+                    Sets number of days in price history
+                */
+                _sim.days = function (days) {
+                    _pricedays = days;
+                    return _sim;
+                };
+
+                // helper functions
+                var obj2arr = function (x) {
+                    if (!x) return;
+                    return Object.keys(x).map(function (k) {
+                        return x[k];
+                    });
+                };
+
+                _sim.run = function () {
+                    return new Promise(function (resolve, reject) {
+
+                        // set up tasks
+                        var loadpf = (new dll.montecarlo.loadPortfolioTask())
+                            .data({ size: _numpos })
+                            .DEFINE('positions');
+                            
+                        var loadPrices = (new dll.montecarlo.loadPricesTask())
+                            .data({ days: _pricedays })
+                            .enum('positions', obj2arr)
+                            .split(_threads);
+                        
+                        var createMatrix = (new dll.montecarlo.createMatrixTask())
+                            .DEFINE('correlationpairs')
+                            .param('positions', obj2arr);
+
+                        var calculateCorrelations = (new dll.montecarlo.calculateCorrelationsTask())
+                            .DEFINE('matrix')
+                            .enum('correlationpairs')
+                            .split(_threads)
+                            .data('positions')
+                            .param(function (scope) { return scope.enumeration.current.x; })
+                            .param(function (scope) { return scope.enumeration.current.y; })
+
+                        Threading
+
+                            // 1. load positions
+                            .stage('PORTFOLIO LOADER').verbose(_verbose)
+                                .task(loadpf)
+
+                            // 2. load price history for each position
+                            .stage('PRICE LOADER').verbose(_verbose)
+                                .task(loadPrices)
+                            
+                            // 3. create correlation matrix
+                            .stage('MATRIX CONSTRUCTOR').verbose(_verbose)
+                                .task(createMatrix)
+
+                            // 3. calculate correlations 
+                            .stage('CORRELATION CALCULATOR').verbose(_verbose)
+                                .task(calculateCorrelations)
+                                
+                            .finish(function (variables, stats) {
+                                resolve({
+                                    positions: variables['positions'],
+                                    matrix: variables['matrix'],
+                                    stats: stats
+                                });
+                            })
+                            
+                            .start();
+
+                    });
+                }
+
+                return _sim;
+            };
+        };
+
+        return _mc;
+    };
+})();
+
+//Portfolio
+//console.break();
+
+dll.inject('portfolio', (function () {
+    return new function () {
+        var _port = this;
+        _port.positions = {};
+        _port.loadPositions = function (number) {
+            [].range(1, number).forEach(function (slot) {
+                var sym;
+                do {
+                    sym = [].range(Math.randomInt(1, 3))
+                        .map(function (c, index) {
+                        return new Char(65 + index);
+                    });
+                }
+                while (_stocks.hasOwnProperty(sym.toUpperCase()));
+                _port.positions[sym] = {
+                    ticker: sym,
+                    dailyPrice: []
+                };
+            });
+        };
+        return _port;
+    };
+})(), 'montecarlo'); // injected
+
+//Pricing
+dll.inject('pricing', (function () {
+    return new function () {
+        var _port = this;
+        _port.positions = {};
+        _port.loadPositions = function (number) {
+            [].range(1, number).forEach(function (slot) {
+                var sym;
+                do { sym = [].range(Math.randomInt(1, 3)).map(function (c, index) { return new Char(65 + index); }); }
+                while (_stocks.hasOwnProperty(sym.toUpperCase()));
+                _port.positions[sym] = {
+                    ticker: sym,
+                    dailyPrice: []
+                };
+            });
+        };
+        return _port;
+    };
+})(), 'montecarlo'); // injected
+
+
+//Correlation
+dll.inject('correlation', (function () {
+    return new function () {
+        var _port = this;
+        _port.positions = {};
+        _port.loadPositions = function (number) {
+            [].range(1, number).forEach(function (slot) {
+                var sym;
+                do { sym = [].range(Math.randomInt(1, 3)).map(function (c, index) { return new Char(65 + index); }); }
+                while (_stocks.hasOwnProperty(sym.toUpperCase()));
+                _port.positions[sym] = {
+                    ticker: sym,
+                    dailyPrice: []
+                };
+            });
+        };
+        return _port;
+    };
+})(), 'montecarlo'); // injected
+
+
+//TASKS
+//calculate correlations
+dll.inject('calculateCorrelationsTask', function () {
+
+    return (new Task())
+    
+        .name('Calculate correlations')
+        .critical()
+
+        .func(function (tickerx, tickery) {
+
+            return new Promise(function (resolve, reject) {
+                
+                ready(function () {
+
+                    var matrix = {};
+
+                    var xprices = data.positions[tickerx].prices;
+                    var yprices = data.positions[tickery].prices;
+
+                    var coef = pearsonCorrelation([xprices, yprices], 0, 1);
+                
+                    matrix[tickerx + tickery] = coef;
+                    
+                    set('matrix', matrix);
+
+                    resolve();
+
+                });
+
+            });
+
+            function pearsonCorrelation(prefs, p1, p2) {
+
+                var si = [];
+
+                for (var key in prefs[p1]) {
+                    if (prefs[p2][key]) si.push(key);
+                }
+
+                var n = si.length;
+
+                if (n == 0) return 0;
+
+                var sum1 = 0;
+                for (var i = 0; i < si.length; i++) sum1 += prefs[p1][si[i]];
+
+                var sum2 = 0;
+                for (var i = 0; i < si.length; i++) sum2 += prefs[p2][si[i]];
+
+                var sum1Sq = 0;
+                for (var i = 0; i < si.length; i++) {
+                    sum1Sq += Math.pow(prefs[p1][si[i]], 2);
+                }
+
+                var sum2Sq = 0;
+                for (var i = 0; i < si.length; i++) {
+                    sum2Sq += Math.pow(prefs[p2][si[i]], 2);
+                }
+
+                var pSum = 0;
+                for (var i = 0; i < si.length; i++) {
+                    pSum += prefs[p1][si[i]] * prefs[p2][si[i]];
+                }
+
+                var num = pSum - (sum1 * sum2 / n);
+                var den = Math.sqrt((sum1Sq - Math.pow(sum1, 2) / n) *
+                    (sum2Sq - Math.pow(sum2, 2) / n));
+
+                if (den == 0) return 0;
+
+                return num / den;
+            }
+
+        });
+
+}, 'montecarlo');
+
+//Create matrix
+dll.inject('createMatrixTask', function () {
+
+    return (new Task())
+
+        .name('Create Matrix')
+        .critical()
+
+        .func(function (positionsArray) {
+
+            return new Promise(function (resolve, reject) {
+                                
+                ready(function () {
+
+                    var matrix = [];
+                    
+                    positionsArray.forEach(function (posx) {
+                        positionsArray.forEach(function (posy) {
+                            matrix.push({
+                                x: posx.ticker,
+                                y: posy.ticker
+                            });
+                        });
+                    });
+                                        
+                    set('correlationpairs', matrix);
+
+                    resolve();
+
+                });
+
+            });
+
+        });
+
+    
+
+}, 'montecarlo');
+
+//Load portfolio
+dll.inject('loadPortfolioTask', function () {
+
+    return (new Task())
+
+        .name('Load portfolio')
+        .critical()
+
+        .func(function () {
+            return new Promise(function (resolve, reject) {
+
+                ready(function () {
+
+                    var positions = {};
+
+                    for (var i = 0; i < data.size; i++) {
+
+                        var sym = 'Pos' + (i + 1);
+
+                        positions[sym] = {
+                            ticker: sym,
+                            prices: []
+                        };
+                    }
+
+                    set('positions', positions);
+
+                    resolve();
+
+                }); //end ready()
+
+            });
+        });
+
+}, 'montecarlo');
+
+
+//Load prices
+dll.inject('loadPricesTask', function () {
+
+    return (new Task())
+
+        .func(function (/*Your parameters here*/) {  
+
+            return new Promise(function (resolve, reject) {
+                
+                ready(function () {
+
+                    var prices = [];
+
+                    for (var i = 0; i < data.days; i++) {
+
+                        var prev = i == 0 ? Math.random() * 100 : prices[i - 1]; 
+                                                
+                        //random change, capped at 10% of previous price
+                        var change = Math.random() * (prev * 0.1);
+                        var dir = Math.random() > 0.5 ? 1 : -1;
+
+                        prices[i] = prev + (change * dir);
+
+                    }
+
+                    set('prices', prices);
+
+                    resolve();
+
+                }); //end ready()
+
+            });
+        });
+
+}, 'montecarlo');
