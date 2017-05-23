@@ -1,0 +1,1347 @@
+var args = (function(){
+    
+    return new function(){
+
+        var instance = this;
+
+        instance.flatten = function (argumentsArray) {
+
+            //because arguments can be passed as param list, an array, or param list of arrays 
+
+            var flatArray = [];
+
+            [].slice.apply(argumentsArray).forEach(function (arg) {
+
+                //treat each argument as if it is an array
+                var units = Array.isArray(arg) ? arg : [arg];
+
+                units.forEach(function (unit) {
+                    switch (typeof unit) {
+                        case 'object':
+                            if (unit.isBatch) {
+                                flatArray.addRange(unit.getTasks());
+                            }
+                            else if (unit.isTask) {
+                                flatArray.push(unit);
+                            }
+                            else {
+                                throw 'Invalid work unit.  Must be a Task, a function or an array of either.';
+                            }
+                            break;
+                        case 'function':
+                            flatArray.push(new Task(unit));
+                            break;
+                    }
+                });
+
+            });
+
+            return flatArray;
+        };
+
+
+        return instance;
+
+    };
+
+})();
+    
+dll.moduleLoaded('args');
+    
+var Batch = function (name) {
+        
+    return new function () {
+
+        var batchInstance = this;
+
+        var getRole = function () {
+            return pad(batchInstance.name,0, 80);
+        };
+        
+        var pad = function (str, left, total) {
+            var left = (new Array(left)).join(' ');
+            var rem = total - str.length - left;
+            var right = rem > 0 ? (new Array(rem)).join(' ') : '';
+            var result = left + str + right;
+            return result;
+        }
+
+        var _verbose = false;
+        var logger = {
+            log: function (message) { if (_verbose) { console.log(getRole() + ': ' + message); batchInstance.stats.log.push(message); } },
+            info: function (message) { if (_verbose) { console.info(getRole() + ': ' + message); batchInstance.stats.log.push(message); } },
+            warn: function (message) { if (_verbose) { console.warn(getRole() + ': ' + message); batchInstance.stats.log.push(message); } },
+            error: function (message) { if (_verbose) { console.error(getRole() + ': ' + message); batchInstance.stats.log.push(message); } }
+        };
+        
+        batchInstance.verbose = function (trueFalse) {
+            _verbose = trueFalse === undefined ? true : trueFalse;
+            return batchInstance;
+        }
+
+        batchInstance.stats = {
+            batchname: name,
+            startTime: undefined,
+            endTime: undefined,
+            status: undefined,
+            exception: undefined,
+            taskcount: 0,
+            syncoption: '',
+            taskstartcount: 0,
+            taskfinishcount: 0,
+            taskfailcount: 0,
+            taskabortcount: 0,
+            taskcriticalcount: 0,
+
+            arrays: 0,
+            items: 0,
+            objects: 0,
+            keys: 0,
+
+            elapsed: 0,
+            log: []
+        };
+
+        batchInstance.variables = {};
+
+        var _units = [];
+        var _finished = [];
+        var _failed = [];
+        var _critical = [];
+        var _aborted = [];
+        var _nextBatch = null;
+        var _syncoption = 'all'; //awaitAll is the default option
+        var _synctimeout = 0; //zero means no timeout
+        var _syncSet = function (o, t, tcb) {
+            _syncoption = o; _synctimeout = t;
+            batchInstance.ontimeout = tcb;
+        };
+        var _finishcallback;
+        var _state;
+                
+        var batchStarting = function () {
+            logger.log('> Start (' + _units.length + ' tasks)');
+        };
+
+        var batchFinished = function () {
+            _units.forEach(function(unit) {
+                unit.terminate();
+            });
+        };
+
+        var batchFailed = function () {
+            logger.warn('>>> (!) Critical task failure.  Batch aborted.');
+            _critical.forEach(function (task, index) {
+                logger.warn(' '.repeat(4) + (index + 1) + '. ' + task.name + ': ' +
+                    task.stats.exception.message);
+            });
+        };
+
+        batchInstance.getElapsedTime = function () {
+            return batchInstance.stats.endTime.getTime() -
+                batchInstance.stats.startTime.getTime();
+        };
+
+        batchInstance.getProcessStats = function () {
+            var batchList = [];
+            if (batchInstance.prevBatch) {
+                batchList = batchInstance.prevBatch.getProcessStats();
+            }
+
+            if (typeof batchInstance.name !== 'function')
+            {
+                batchInstance.stats.name = batchInstance.name;
+            }
+            
+            batchInstance.stats.elapsed = batchInstance.getElapsedTime();
+            batchList.push(batchInstance.stats);
+
+            return batchList;
+        };
+
+        var finishBatch = function () {
+            _state = 'finished';
+            batchFinished();
+            if (_nextBatch) {
+                _nextBatch.execute();
+            }
+            else if (_finishcallback) {
+
+                var batchstats = batchInstance.getProcessStats();
+
+                _finishcallback(batchInstance.variables, batchstats);
+            }
+        };
+
+        var failBatch = function () {
+            batchFailed();
+        };
+
+        var tryFinishBatch = function () {
+            if (batchInstance.stats.taskcriticalcount) {
+
+                batchInstance.status = 'fail';
+                batchInstance.stats.endTime = new Date();
+
+                failBatch();
+            }
+            if (batchInstance.stats.syncoption === 'all') {
+
+                //must wait for all tasks to finish and have no critical tasks fail
+                if (batchInstance.stats.taskcount === batchInstance.stats.taskfinishcount &&
+                    batchInstance.stats.taskcriticalcount == 0) {
+                    
+                    batchInstance.status = 'finished';
+                    batchInstance.stats.endTime = new Date();
+
+                    logger.info('> Success.  All tasks finished.  (' +
+                        batchInstance.getElapsedTime() + ' ms)');
+
+                    finishBatch();
+                }
+            }
+            else if (batchInstance.stats.syncoption === 'any') {
+                if (batchInstance.stats.taskfinishcount > 0) {
+
+                    batchInstance.status = 'finished';
+                    batchInstance.stats.endTime = new Date();
+
+                    logger.info('> Success.  At least one task finished.  (' +
+                        batchInstance.getElapsedTime() + ' ms)');
+
+                    //stop all running tasks
+                    _units.forEach(function (task) {
+                        if (task.stats.status === 'executing') {
+                            task.abort();
+                        }
+                    });
+
+                    //check defined variables, 
+                    //generate warnings if any variables have not been set
+                    Object.keys(_variables).forEach(function (key) {
+
+                        //cannot just check the variable if(var) as truthy, 
+                        //the value may be 0 or false but its still a value
+                        //although arguably, null is also a value
+                        if (_variables[key]===null || _variables[key]===undefined) {
+                            logger.warn(key + ' is defined but its value was not set');
+                        }
+                    });
+
+                    finishBatch();
+                }
+                
+            }
+        };
+        
+        /*
+            Defines a variable.  
+
+            When workers transfer data back to Tasks using transfer(key,value) 
+            variables whose names match keys will automatically be set 
+            by task.relay(key,value) which calls batch.update(key, value)
+
+            key names are case insensitive, i.e. INDEX is same as index
+        */
+        batchInstance.define = batchInstance.DEFINE = function (name) {
+            if (batchInstance.variables.hasOwnProperty(name.toLowerCase())) {
+                logger.error('> ' + name + ' is already defined (variable names are not case sensitive)');
+            }
+            logger.log('> DEFINE : ' + name.toLowerCase());
+            batchInstance.variables[name.toLowerCase()] = null;
+            return batchInstance;
+        };
+
+        /*
+            Backpropagate updates a variable only IF the variable is defined
+            returns true if update succeeds
+        */
+        batchInstance.backpropagate = function (name, value) {
+            if (batchInstance.variables.hasOwnProperty(name.toLowerCase())) {
+
+                if (Array.isArray(value)) {
+                    batchInstance.stats.arrays++;
+                    batchInstance.stats.items += value.length;
+                }
+                else {
+                    batchInstance.stats.objects++;
+                    batchInstance.stats.keys += Object.keys(value).length;
+                }
+
+                batchInstance.variables[name.toLowerCase()] = value;
+                if (_nextBatch) {
+                    if (typeof _nextBatch.propagate !== 'undefined') {
+                        _nextBatch.propagate(name, value);
+                    }
+                }
+                return true;
+            }
+            return false;
+        };
+        /*
+            Propagate creates a named variable if its not defined.
+            So a variable defined in the first batch, is also available in
+            the subsequent batches.
+
+            returns true if update succeeds
+        */
+        batchInstance.propagate = function (name, value) {
+            if (!batchInstance.variables.hasOwnProperty(name.toLowerCase())) {
+                //we don't need to create a variable before setting it
+                logger.log('>    SET : ' + name.toLowerCase() + ' = ' + (Array.isArray(value) ? 'array[' + value.length + ']' : value));
+            }
+            batchInstance.variables[name.toLowerCase()] = value;
+            if (_nextBatch) {
+                if (typeof _nextBatch.propagate !== 'undefined') {
+                    _nextBatch.propagate(name, value);
+                }
+            }
+            return true;
+        };
+
+
+        batchInstance.name = name[0];
+        batchInstance.prevBatch = null;
+        batchInstance.isBatch = true;
+        batchInstance.tasks = function () { return _units; };
+        batchInstance._setNextBatch = function (batch) {
+            batch.prevBatch = batchInstance;
+            _nextBatch = batch; return batch;
+        };
+        batchInstance.ontimeout = null;
+        batchInstance.onerror = null;
+
+        // with awaitAll execution of next batch will be blocked 
+        // until all tasks in current batch succeed or timeout is reached.
+        batchInstance.awaitAll = function (timeout, ontimeout) {
+            _syncSet('all', timeout, ontimeout);
+            return batchInstance;
+        };
+
+        // with awaitAny execution of next batch will be blocked 
+        // until at least one of the tasks in the current batch 
+        //succeeds or timeout is reached.
+        batchInstance.awaitAny = function (timeout, ontimeout) {
+            _syncSet('any', timeout, ontimeout);
+            return batchInstance;
+        };
+
+        batchInstance.stage = batchInstance.then = function (workunits) {
+            var newBatch = new Batch(Array.from(arguments));
+            batchInstance._setNextBatch(newBatch);
+            return newBatch;
+        };
+
+        batchInstance.tasks = function () {
+            return _units;
+        };
+
+        batchInstance.finished = function () {
+            return _units.filter(function (task) {
+                return task.status === 'finished';
+            });
+        };
+
+        batchInstance.failed = function () {
+            return _units.filter(function (task) {
+                return task.status === 'failed';
+            });
+        };
+
+        batchInstance.aborted = function () {
+            return _units.filter(function (task) {
+                return task.status === 'aborted';
+            });
+        };
+
+        batchInstance.executing = function () {
+            return _units.filter(function (task) {
+                return task.status === 'executing';
+            });
+        };
+
+        batchInstance.taskEvent = function (task, message) {
+            batchInstance.stats.log.push('(task) ' + (task.cloneName || task.name) + ': ' + message);
+        };
+
+        batchInstance.getRoot = function () {
+            if (batchInstance.prevBatch) return batchInstance.prevBatch.getRoot();
+            return batchInstance;
+        };
+
+        batchInstance.start = function () {
+            //start the process
+            batchInstance.getRoot().execute();
+        };
+
+        batchInstance.finish = function (fn) {
+            _finishcallback = fn;
+            return batchInstance;
+        };
+        
+        batchInstance.execute = function () {
+
+            if (!batchInstance.name || typeof batchInstance.name === 'function') batchInstance.name = 'Batch';
+
+            if (_state) return; //exit if already started
+            _state = 'started';
+                        
+            batchInstance.status = 'executing';
+            batchInstance.stats.syncoption = _syncoption;
+
+            batchInstance.stats.startTime = new Date();
+            
+            batchStarting();
+
+            var clones = [];
+
+            _units.forEach(function (task) {
+
+                if (task.isEnumerator()) {
+                    
+                    var enumeratedArray = task.getEnumeratedArray();
+
+                    if (task.partitions && task.partitions > 1) {
+
+                        //breakup enumerated array into the specified number of partitions
+                        //for each partition, create a clone of the task and give it the 
+                        //partition
+
+                        var count = task.partitions;
+                        var size = Math.ceil(enumeratedArray.length / count);
+
+                        [].range(task.partitions).forEach(function (n, index) {
+
+                            var start = size * index;
+                            var end = Math.min(size * index + size, enumeratedArray.length);
+
+                            var partition = enumeratedArray.slice(start, end);
+
+                            if (partition.length > 0) {
+                                var clone = new Task();
+                                clone.verbose(_verbose);
+                                task.copy(clone);
+                                clone.cloneName = 'partition ' + (index + 1);
+                                clone.setPartition(partition);
+                                task.clones.push(clone);
+                            }
+                        });
+                    }
+                    else {
+                        task.setPartition(enumeratedArray); //no split
+                    }
+                }
+
+
+            });
+
+            batchInstance.stats.taskcount = _units.reduce((a,b)=>a+b.clones.length||1, 0);
+
+            //execute each one
+            _units.forEach(function (unit) {
+                unit.execute();
+            });
+        };
+
+        batchInstance.taskStarted = function (task) {
+            batchInstance.stats.taskstartcount++;
+        };
+
+        batchInstance.taskFinished = function (task) {
+
+            if (batchInstance.status != 'executing') {
+                return;
+            }
+
+            _finished.push(task);
+            batchInstance.stats.taskfinishcount++;
+            tryFinishBatch();
+        };
+
+        batchInstance.taskFailed = function (task) {
+            _failed.push(task);
+            if (task.isCritical) {
+                batchInstance.stats.taskcriticalcount++;
+                _critical.push(task);
+            }
+            batchInstance.stats.taskfailcount++;
+            tryFinishBatch();
+        };
+
+        batchInstance.taskAborted = function (task) {
+            _aborted.push(task);
+            if (task.isCritical) {
+                batchInstance.stats.taskcriticalcount++;
+            }
+            batchInstance.stats.taskabortcount++;
+            tryFinishBatch();
+        };
+        
+        var flattenArgs = function (argumentsArray) {
+
+            /*
+                Since arguments can be passed as param list, an array, 
+                or param list of arrays...
+                it's bad...
+            */
+
+            var good = []; //a flat array is good
+
+            [].slice.apply(argumentsArray).forEach(function (arg) {
+
+                //treat each argument as if it is an array
+                var units;
+
+                if (Array.isArray(arg)) {
+                    if (Array.isArray(arg[0])) {
+                        units = Array.from(arg[0]);
+                    }
+                    else
+                    {
+                        units = Array.from(arg);
+                    }
+                }
+                else{
+                    units = [arg];
+                }
+
+                units.forEach(function (it) {
+
+                    if (it.isBatch) {
+                        
+                        //if Batch, grab its tasks 
+                        good.addRange(it.tasks());
+
+                    }
+                    else if (it.isTask) {
+
+                        //ah...
+                        good.push(it);
+
+                    }
+                    else {
+
+                        throw 'There is no parameter like an instance of a Task';
+
+                    }
+
+                });
+
+            });
+
+            return good;
+        };
+        
+        batchInstance.task = function (workunits) {
+            var _args = Array.from(arguments);
+            _units = flattenArgs(_args);
+            _units.forEach(function (unit) {
+                Object.keys(unit.variables).forEach(function (key) {
+                    batchInstance.define(key);
+                });
+
+                unit.setParent(batchInstance);
+            });
+            return batchInstance;
+        };
+        
+        return batchInstance;
+
+    };
+
+};
+dll.moduleLoaded('Batch', 'threading'); //notify the dll
+
+var Prototypes = {
+
+    //a dictionary of sample implementations
+    fn: function (payload) { /* Your function to be run on a separate thread. */ },
+    payload: { /* Optional data that your function needs, it will be passed as the only parameter to the function. */ },
+    taskId: { /* Your own id for the process. */ },
+    onsuccess: function () { /* A function with no args. */ },
+    onerror: function () { /* A function with no args. */ },
+    onrequest: function (requestKey) {
+        /* 
+        - Fired when the process needs data from the main thread.  
+        - Implementation must return data based on request key
+          or throw an error if request key is not valid.
+        */
+        switch (requestKey) {
+            case 'entitytype':
+                return 'Item';
+            default:
+                throw 'Invalid request key';
+        }
+    }
+};
+
+var Sample = function (fn) {
+    return new function () {
+        var sampleInstance = this;
+        sampleInstance.code = fn.toString();
+        return sampleInstance;
+    };
+};
+
+var TaskOptions = {
+    fn: new Sample(Prototypes.fn),
+    payload: new Sample(Prototypes.payload),
+    taskId: new Sample(Prototypes.taskId),
+    onsuccess: new Sample(Prototypes.onsuccess),
+    onerror: new Sample(Prototypes.onerror),
+    onrequest: new Sample(Prototypes.onrequest),
+};
+
+var Task = function () {
+    
+    var pad = function (str, left, total) {
+        var left = (new Array(left)).join(' ');
+        var rem = total - str.length - left;
+        var right = rem > 0 ? (new Array(rem)).join(' ') : '';
+        var result = left + str + right;
+
+        return result;
+    }
+
+    var WorkerAgent = function (task) {
+
+        var _verbose = true;
+        var logger = {
+            log: function (message) { if (_verbose) console.log(pad(message, 8, 80)); },
+            info: function (message) { if (_verbose) console.info(pad(message, 8, 80)); },
+            warn: function (message) { if (_verbose) console.warn(pad(message, 8, 80)); },
+            error: function (message) { if (_verbose) console.error(pad(message, 8, 80)); }
+        };
+
+        var workerInstance = this;
+        
+        workerInstance.verbose = function (trueFalse) {
+            //_verbose = trueFalse === undefined ? true : trueFalse;
+            return workerInstance;
+        }
+        
+        workerInstance.enumerationIndex;
+        workerInstance.enumerationContext;
+
+        var _task = task;
+                
+        var _workerBlobUrl;
+        var _worker;
+        
+        var buildWorkerFramework = function () {
+            var __wf = function () {
+                var _state;
+                var _event = function (name, message) { self.postMessage({ cmd: 'event-' + name, message: message }); };
+                var _main = function () { /*_worker_main_function_*/ };
+                var data = {};
+                var info = function (message) { self.postMessage({   cmd:    'info', message: message }); };
+                var warn = function (message) { self.postMessage({   cmd: 'warning', message: message }); };
+                var error = function (message) { self.postMessage({  cmd:   'error', message: message }); };
+                var set = function (key, value) { self.postMessage({ cmd:     'set',     key: key, value: value }); };
+                self.onmessage = function (e) {
+                    switch (e.data.cmd) {
+                        case 'execute':
+                            _event('execute');
+                            _state = 'executing';
+                            try {
+                                _main.apply(self, e.data.params).then(function () { // <-- call main().then()
+                                    _event('finish');
+                                });
+                            } catch (ex) {
+
+                                error(ex.message);
+                            }
+                            break;
+                        case 'abort':
+                            _state = 'aborted';
+                            self.close();
+                            break;
+                        case 'data':
+                            info('got data');
+                            data = e.data.data;
+                            break;
+                        default:
+                            break;
+                    };
+                };
+                var _scriptsrequested = 0;
+                var _scriptsloaded = 0;
+                var loadScript = function (url) {
+                    info('Loading script: ' + url);
+                    _scriptsrequested++;
+                    let xhr = new XMLHttpRequest();
+                    xhr.onload = function () {
+                        //info('Contents of ' + url + ':\n' + this.responseText);
+                        eval(this.responseText);
+                        _scriptsloaded++;
+                        tryReadyCallbacks();
+                    };
+                    xhr.open("GET", url, true);
+                    xhr.send();
+                }
+                var _readycallback;
+                ready = function (cb) {
+                    if (!isready()) { _readycallback = cb; return; }
+                    cb();
+                };
+                var tryReadyCallbacks = function () {
+                    if (!isready()) return;
+                    _readycallback();
+                };
+                var isready = function () {
+                    return _scriptsrequested === _scriptsloaded;
+                };
+
+                _event('build');
+            };
+
+            //now wrap it
+            var _workerCode = '(' +
+                __wf.toString().replace(/function\s*\(\)\s*\{\s*\/\*\_worker\_main\_function\_\*\/\s*\}/,
+                workerInstance.func.toString()) + ')()';
+            
+            var _blob = new Blob([_workerCode]);
+            _workerBlobUrl = window.URL.createObjectURL(_blob);
+            _worker = new Worker(_workerBlobUrl);
+            _worker.addEventListener('message', function (e) {
+                switch (e.data.cmd) {
+                    case 'event-build':
+                        if (_cb.onbuild) _cb.onbuild();
+                        break;
+                    case 'event-execute':
+                        if (_cb.onexecute) _cb.onexecute();
+                        break;
+                    case 'event-finish':
+                        window.URL.revokeObjectURL(_workerBlobUrl);
+                        if (_cb.onfinish) _cb.onfinish();
+                        break;
+                    case 'event-abort':
+                        window.URL.revokeObjectURL(_workerBlobUrl);
+                        _worker.terminate();
+                        logger.log('>> aborted');
+                        if (_cb.onabort) _cb.onabort();
+                        break;
+                    case 'info':
+                        logger.info('>> ' + e.data.message);
+                        if (_cb.oninfo) _cb.oninfo(e.data.message);
+                        break;
+                    case 'warning':
+                        logger.warn('>> ' + e.data.message);
+                        if (_cb.onwarning) _cb.onwarning(e.data.message);
+                        break;
+                    case 'error':
+                        window.URL.revokeObjectURL(_workerBlobUrl);
+                        _worker.terminate();
+                        logger.error('>> ' + e.data.message);
+                        if (_cb.onerror) _cb.onerror(e.data.message);
+                        break;
+                    case 'set':
+                        _setResult(e.data.key, e.data.value);
+                        if (_cb.onresult) _cb.onresult(e.data.key, e.data.value);
+                        break;
+                    default:
+                        logger.log(' '.repeat(8) + '. (worker): ' + 'Worker sent unknown command ' + e.data.cmd);
+                };
+            }, false);
+        };
+        
+        workerInstance.func = undefined;
+        workerInstance.build = function () { buildWorkerFramework(); };
+        workerInstance.data = function (data) {
+            if (data && data!='function') {
+                _worker.postMessage({ cmd: 'data', data: data });
+            }
+        };
+        
+        workerInstance.execute = function (paramsArray) {
+            _worker.postMessage({ cmd: 'execute', params: paramsArray });
+        };
+        workerInstance.abort = function () { _worker.postMessage({ cmd: 'abort' }); };
+        workerInstance.terminate = function () { _worker.terminate(); };
+
+        var _cb = {};
+        workerInstance.onbuild = function (cb) { _cb.onbuild = cb; };
+        workerInstance.onexecute = function (cb) { _cb.onexecute = cb; };
+        workerInstance.onfinish = function (cb) { _cb.onfinish = cb; };
+        workerInstance.onabort = function (cb) { _cb.onabort = cb; };
+        workerInstance.oninfo = function (cb) { _cb.oninfo = cb; };
+        workerInstance.onwarning = function (cb) { _cb.onwarning = cb; };
+        workerInstance.onerror = function (cb) { _cb.onerror = cb; };
+        workerInstance.onresult = function (cb) { _cb.onresult = cb; };
+        
+        //called by the main function executing inside the worker thread
+        //to send back a result by name
+        var _setResult = function (key, value) {
+            //if the current context is an object, e.g. enumerated element
+            //and it has a defined property by the same name
+            //that property will be set and propagation will stop there
+            if (workerInstance.enumerationContext && !Array.isArray(workerInstance.enumerationContext) && workerInstance.enumerationContext.hasOwnProperty(key)) {
+                workerInstance.enumerationContext[key] = value;
+            }
+            else {
+                //otherwise the result will propagate
+                _task.relay(key, value);
+            }
+        }
+
+        return workerInstance;
+    };
+
+    return new function () {
+
+        var taskInstance = this;
+        
+        var onsuccess = undefined;
+        var onerror = undefined;
+
+        taskInstance.stats = {
+            startTime: undefined,
+            endTime: undefined,
+            status: undefined,
+            exception: undefined,
+        };
+
+        /* 
+            _scope 
+            
+            represents current Task's execution scope and all objects in it
+            scope is passed as parameter to the call back functions used in setters e.g. param(fn):
+            
+            e.g. 
+                       
+            task.param(function(scope) {
+                return scope.variables.myVariable;
+            });
+
+            will result in the value of myVarriable, defined and set earlier, to be passed 
+            to the current task
+        */
+        taskInstance._scope = {
+
+            task: taskInstance,
+
+            batch: undefined,
+            variables: undefined, //point to batch.variables
+
+            stats: taskInstance.stats,
+            enumeration: undefined,
+                        
+            params: [],
+            dataparams: []
+        };
+        
+        taskInstance.parent = undefined;
+        taskInstance.setParent = function (parent) {
+            taskInstance.parent = parent;
+            taskInstance._scope.batch = taskInstance.parent;
+            taskInstance._scope.variables = taskInstance.parent.variables; //point to batch.variables
+        };
+
+        var getRole = function () {
+            if (taskInstance.cloneName) return taskInstance.name + ': ' + taskInstance.cloneName;
+            return taskInstance.name;
+        };
+
+        var _verbose = false;
+        var logger = {
+            log: function (message) {
+                if (_verbose) {
+                    console.log(pad(getRole(), 4, 80) + ': ' + message);
+                    if (taskInstance.parent) {
+                        taskInstance.parent.taskEvent(taskInstance, message);
+                    }
+                }
+            },
+            info: function (message) {
+                if (_verbose) {
+                    console.info(pad(getRole(), 4, 80) + ': ' + message);
+                    if (taskInstance.parent) {
+                        taskInstance.parent.taskEvent(taskInstance, message);
+                    }
+                }
+            },
+            warn: function (message) {
+                if (_verbose) {
+                    console.warn(pad(getRole(), 4, 80) + ': ' + message);
+                    if (taskInstance.parent) {
+                        taskInstance.parent.taskEvent(taskInstance, message);
+                    }
+                }
+            },
+            error: function (message) {
+                if (_verbose) {
+                    console.error(pad(getRole(), 4, 80) + ': ' + message);
+                    if (taskInstance.parent) {
+                        taskInstance.parent.taskEvent(taskInstance, message);
+                    }
+                }
+            }
+        };
+
+        taskInstance.verbose = function (trueFalse) {
+            _verbose = trueFalse === undefined ? true : trueFalse;
+            return taskInstance;
+        }
+                
+        var getRoot = function () {
+            if (taskInstance.parent) return taskInstance.parent.getRoot();
+            throw 'Task must have a parent batch';
+        };
+        
+        var taskStarted = function () {
+            logger.log('> Start');
+            if (taskInstance.parent) taskInstance.parent.taskStarted(taskInstance);
+        };
+
+        var taskFinished = function () {
+            logger.log('> Finished (' + taskInstance.getElapsedTime() + ' ms)');
+            if (taskInstance.parent) {
+                taskInstance.parent.taskFinished(taskInstance);
+            }
+        };
+
+        var taskFailed = function () {
+            logger.log('>>> FAILED: ' + taskInstance.stats.exception.message);
+            if (taskInstance.parent) taskInstance.parent.taskFailed(taskInstance);
+        };
+        
+        //set the execution mode, main thread or worker
+        taskInstance.mode = 'worker';
+        taskInstance.worker = function () { taskInstance.mode = 'worker'; return taskInstance; };
+        taskInstance.main = function () { taskInstance.mode = 'main'; return taskInstance; };
+
+        taskInstance.isTask = true;
+        taskInstance.isCritical = true;
+
+        taskInstance.cloneName;
+
+        taskInstance.name = function (name) {
+            taskInstance.name = name;
+            return taskInstance;
+        };
+        taskInstance.func = function (fn) {
+            taskInstance.func = fn;
+            return taskInstance;
+        };
+        
+        taskInstance.success = function (fn) {
+            onsuccess = fn;
+            return taskInstance;
+        };
+        taskInstance.error = function (fn) {
+            onerror = fn;
+            return taskInstance;
+        };
+        taskInstance.failable = function (/*optional true or false*/) {
+            if (arguments.length === 1) {
+                taskInstance.isCritical = arguments[0] ? false : true;
+            }
+            else {
+                taskInstance.isCritical = false;
+            }
+            return taskInstance;
+        };
+        taskInstance.critical = function (/*optional true or false*/) {
+            if (arguments.length === 1) {
+                taskInstance.isCritical = arguments[0] ? true: false;
+            }
+            else {
+                taskInstance.isCritical = true;
+            }
+            return taskInstance;
+        };
+
+        taskInstance.start = function () {
+            //start the process
+            taskInstance.getRoot().execute();
+        };
+
+        taskInstance.abort = function () {
+            _agent.abort();
+            if (status == 'executing') {
+                taskInstance.status = 'aborted';
+                taskInstance.stats.endTime = new Date();
+                logger.log(taskInstance.name + ' forcefully aborted after ' +
+                    taskInstance.getElapsedTime() + ' ms');
+                if (taskInstance.parent) {
+                    taskInstance.parent.taskAborted(taskInstance);
+                }
+            }
+        };
+
+        taskInstance.terminate = function () {
+
+            if (_agent) _agent.terminate();
+
+            if (taskInstance.clones.length > 0) {
+                taskInstance.clones.forEach(function (c) {
+                    c.terminate();
+                });
+            }
+
+            if (status == 'executing') {
+                taskInstance.status = 'terminated';
+                taskInstance.stats.endTime = new Date();
+                logger.log(taskInstance.name + ' terminated after ' +
+                    taskInstance.getElapsedTime() + ' ms');
+                if (taskInstance.parent) {
+                    taskInstance.parent.taskAborted(taskInstance);
+                }
+            }
+        };
+
+        taskInstance.getElapsedTime = function () {
+            return taskInstance.stats.endTime.getTime() -
+                taskInstance.stats.startTime.getTime();
+        };
+
+        var propagate = function (target, key, value) {
+            if (typeof target.propagate !== 'undefined') {
+                target.propagate(key, value);
+            }
+        };
+
+        var backpropagate = function (target, key, value) {
+            if (typeof target.backpropagate !== 'undefined') {
+                target.backpropagate(key, value);
+            }
+        };
+
+        taskInstance.relay = function (key, value) {
+
+            var msg = '';
+
+            if (Array.isArray(value)) {
+                msg = '<= ' + key + ' = array[' + value.length + ']';
+            }
+            else {
+
+                var objstring;
+
+                if(typeof value === 'object'){
+                    var keys = Object.keys(value);
+                    if(keys.length==1){
+                        objstring = value;
+                    }
+                    else
+                    {
+                        objstring = 'object[' + Object.keys(value).length + ' keys]';
+                    }
+                }
+                else{
+                    objstring = value;
+                }
+
+                msg = '<= ' + key + ' = ' + objstring;
+            }
+            
+            logger.log(msg);
+            if (taskInstance.parent) {
+                backpropagate(taskInstance.parent, key, value);
+            }
+
+        };
+
+        /*
+            Defines a variable.  
+
+            When workers transfer data back to Tasks using transfer(key,value) 
+            variables whose names match keys will automatically be set 
+            by task.relay(key,value) which calls batch.update(key, value)
+
+            key names are case insensitive, i.e. INDEX is same as index
+        */
+        taskInstance.variables = {};
+        taskInstance.define = taskInstance.DEFINE = function (name) {
+            if (taskInstance.parent) taskInstance.parent.define(name);
+            if (taskInstance.variables.hasOwnProperty(name.toLowerCase())) {
+                logger.error('>>> ' + name + ' is already defined (variable names are not case sensitive)');
+            }
+            //logger.log('> DEFINE : ' + name.toLowerCase());
+            taskInstance.variables[name.toLowerCase()] = null;
+            return taskInstance;
+        };
+
+        taskInstance.copyScope = function (scope) {
+            taskInstance._scope = scope;
+        };
+
+        taskInstance.copy = function (target) {
+
+            Object.keys(taskInstance).forEach(function (key) {
+                var what = taskInstance[key];
+                var type = typeof what;
+                if (type !== 'function') {
+                    switch (key) {
+                        case '_scope':
+                        case 'clones':
+                        case 'partitions':
+                            break;
+                        default:
+                            target[key] = taskInstance[key];
+                            break;
+                    }
+                }
+            });
+                        
+            target.func(taskInstance.func);
+            if (typeof data === 'function') target.data(taskInstance.data);
+
+            if (taskInstance._scope.enumeration) {
+                target.enum(taskInstance._scope.enumeration.select, taskInstance._scope.enumeration.transform);
+            }
+            
+            target._scope.params = taskInstance._scope.params;
+            target._scope.dataparams = taskInstance._scope.dataparams;
+            target.setParent(taskInstance.parent);
+
+            return target;
+        }
+
+        taskInstance._scope.enumeration = undefined;
+        taskInstance.setPartition = function (array) {
+            taskInstance._scope.enumeration.enumeratedPartition = array;
+            
+        };
+        
+        taskInstance.isEnumerator = function () {
+            return taskInstance._scope.enumeration ? true : false;
+        };
+
+        var _agent;
+        taskInstance.execute = function () {
+
+            if (typeof taskInstance.name === 'function') taskInstance.name = 'Task';
+            if (typeof taskInstance.data === 'function') taskInstance.data = null;
+
+            var n = taskInstance.name;
+
+            taskInstance.status = 'executing';
+            taskInstance.stats.startTime = new Date();
+            
+            try {
+                
+                if (taskInstance.clones.length > 0) {
+                    //execute clones
+                    taskInstance.clones.forEach(function (clone) {
+                        clone.execute();
+                    });
+                }
+                else {
+                    //original task
+                    if (taskInstance._scope.enumeration) {
+                        executeEnumeration(paramArray);
+                    }
+                    else {
+                        var paramArray = taskInstance.getParamValues(taskInstance._scope.variables);
+                        executeOnce(paramArray);
+                    }
+
+                    taskStarted();
+                }
+                
+                
+            }
+            catch (ex) {
+                taskInstance.status = 'failed';
+                taskInstance.stats.endTime = new Date();
+                taskInstance.stats.exception = ex;
+                taskFailed();
+                if (onerror) onerror.call(); 
+            }
+        };
+                
+        var executeEnumeration = function () {
+
+            _agent = new WorkerAgent(taskInstance);
+            _agent.verbose(_verbose);
+            _agent.oninfo(function (msg) { });
+            _agent.onwarning(function (msg) { });
+            _agent.onerror(function (msg) { });
+            _agent.onbuild(function () { });
+            _agent.onexecute(function () { });
+            _agent.onabort(function () { });
+            _agent.func = taskInstance.func;
+            _agent.build();
+
+            if (typeof taskInstance.data === 'string') {
+                _agent.data(taskInstance.getDataParamValues());
+            }
+            else {
+                _agent.data(taskInstance.data);
+            }
+            
+
+            _agent.onfinish(function () {
+
+                _agent.enumerationIndex++;
+
+                if (_agent.enumerationIndex < taskInstance._scope.enumeration.enumeratedPartition.length) {
+                    taskInstance._scope.enumeration.current = taskInstance._scope.enumeration.enumeratedPartition[_agent.enumerationIndex];
+                    _agent.enumerationContext = taskInstance._scope.enumeration.current;
+
+                    var paramArray = taskInstance.getParamValues(taskInstance._scope.variables);
+                    _agent.execute(paramArray);
+                }
+                else {
+                    taskInstance.status = 'finished';
+                    taskInstance.stats.endTime = new Date();
+                    taskFinished();
+                    if (onsuccess) onsuccess.call(taskInstance);
+                }
+            });
+
+            if (taskInstance._scope.enumeration.enumeratedPartition.length > 0) {
+                _agent.enumerationIndex = 0;
+                taskInstance._scope.enumeration.current = taskInstance._scope.enumeration.enumeratedPartition[0];
+                _agent.enumerationContext = taskInstance._scope.enumeration.current;
+
+                var paramArray = taskInstance.getParamValues(taskInstance._scope.variables);
+                _agent.execute(paramArray);
+            }
+            
+        };
+
+        var executeOnce = function (paramArray) {
+            _agent = new WorkerAgent(taskInstance);
+            _agent.verbose(_verbose);
+            _agent.oninfo(function (msg) { });
+            _agent.onwarning(function (msg) { });
+            _agent.onerror(function (msg) { });
+            _agent.onbuild(function () { });
+            _agent.onexecute(function () { });
+            _agent.onabort(function () { });
+            _agent.onfinish(function () {
+                taskInstance.status = 'finished';
+                taskInstance.stats.endTime = new Date();
+                taskFinished();
+                if (onsuccess) onsuccess.call(taskInstance);
+            });
+            _agent.func = taskInstance.func;
+            _agent.build();
+            if (typeof taskInstance.data === 'string') {
+                _agent.data(taskInstance.getDataParamValues());
+            }
+            else {
+                _agent.data(taskInstance.data);
+            }
+            _agent.execute(paramArray);
+        };
+
+        /*
+            Enumerates a named variable array and projects each element as arg to task.
+            If the second argument is a string, then its used as a name 
+            argument into the selector.  The return value of the selector becomes 
+        */
+        taskInstance.enum = function (select, transform) {
+            taskInstance._scope.enumeration = {};
+            taskInstance._scope.enumeration.select = select;
+            taskInstance._scope.enumeration.transform = transform;
+            return taskInstance;
+        };
+
+        var fnSelectTransform = function (s, t) {
+            var selVal = (typeof s === 'function') ? s(taskInstance._scope) : taskInstance._scope.variables[s];
+            if (t) return t(selVal); else return selVal;
+        };
+
+        taskInstance.getEnumeratedArray = function () {
+            return fnSelectTransform(taskInstance._scope.enumeration.select, taskInstance._scope.enumeration.transform);
+        };
+          
+
+        /*
+            You can pass a variable name and it will be selected once and sent to the agent just before it runs
+        */        
+        taskInstance.data = function (data, transform) {
+            var value;
+            if(typeof data === 'string'){
+                taskInstance._scope.dataparams.push({ select: data, transform: transform });
+                taskInstance.data = '';
+            }
+            else {
+                value = data;
+                taskInstance.data = (transform ? transform(value) : value);
+            }
+            return taskInstance;
+        };
+        taskInstance.getDataParamValues = function () {
+            var data = {};
+            taskInstance._scope.dataparams.forEach(function (p) {
+                data[p.select] = taskInstance._scope.variables[p.select];
+            });
+            return data; //shorten this
+        };
+
+        /*
+            Specify a parameter value to be passed to the worker function
+                @select     - variableName OR function(scope) { return scope.variables.myVar }
+                @transform  - a function which takes the output of @select and returns a new form
+        */
+        taskInstance.param = function (select, transform) {
+            taskInstance._scope.params.push({ select: select, transform: transform });
+            return taskInstance;
+        };
+        taskInstance.getParamValues = function (variables) {
+            var retval = taskInstance._scope.params.map(function (p) {
+                return fnSelectTransform(p.select, p.transform);
+            });
+            return retval; //shorten this
+        };
+
+        taskInstance.partitions = 1;
+        taskInstance.split = function (count) {
+            taskInstance.partitions = count;
+            return taskInstance;
+        };
+
+        taskInstance.clones = [];
+
+        return taskInstance;
+        
+    };
+};
+dll.moduleLoaded('Task', 'threading');
+
+var Threading = (function () {
+    return new function () {
+        var _thr = this;
+        var _ready = false;
+        var _last = null;
+
+        _thr.stage = function (workunits) {
+            var batch = new Batch(Array.from(arguments));
+            if (!_last) { _last = batch; }
+            else {_last = _last._setNextBatch(batch);}
+            return batch;
+        };
+
+        //build the Threading library        
+        dll.namespace('threading')
+
+            .load('task', '/content/solution/eqd/threading/js/task.js')
+            .load('batch', '/content/solution/eqd/threading/js/batch.js')
+
+            .extend(_thr) //vs .build()
+
+            .yield(function () {
+                if (_ready) return;
+                _ready = true;
+                _readycallbacks.forEach(function (cb) { cb(); });
+            });
+
+        var _readycallbacks = [];
+        _thr.ready = function (cb) {
+            if (!_ready) { _readycallbacks.push(cb); return; }
+            cb();
+        };
+        
+        return _thr;
+
+    };
+
+})();
+dll.moduleLoaded('threading', 'threading');
+
+
+
