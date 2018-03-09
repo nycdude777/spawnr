@@ -341,7 +341,7 @@ var $e = function (tag, content) {
         var tag = stack.pop();
         var eNode = document.createElement(tag.name);
 
-        if (tag.id) { eNode.setAttribute('id', id); }
+        if (tag.id) { eNode.setAttribute('id', tag.id); }
         if (tag.className) { eNode.setAttribute('class', tag.className.split('.').join(' ')); }
 
         tag.attributes.forEach(function (attr) { eNode.setAttribute(attr.key, attr.value); });
